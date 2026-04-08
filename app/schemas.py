@@ -22,6 +22,39 @@ class RPEpisode(BaseModel):
     turn_range: list[int] = Field(description="Turn range [start, end]", min_length=2, max_length=2)
 
 
+# ── Character State (Profile Memory) ────────────────────────────
+
+
+class CharacterState(BaseModel):
+    """Dynamic NPC state. Uses enable_inserts=False (update only)."""
+
+    name: str = Field(description="Character canonical name")
+    hp: int = Field(default=100, description="Hit points")
+    location: str = Field(default="unknown", description="Current location")
+    emotional_state: str = Field(default="neutral", description="Current emotion")
+    active_effects: list[str] = Field(default_factory=list, description="Active buffs/debuffs")
+    last_action: str = Field(default="", description="Last significant action")
+
+
+# ── Relationship ────────────────────────────────────────────────
+
+
+class Relationship(BaseModel):
+    """Dynamic relationship between two characters."""
+
+    source: str = Field(description="Character A")
+    target: str = Field(description="Character B")
+    relation_type: str = Field(description="ally, enemy, romantic, neutral, etc.")
+    trust_level: float = Field(
+        ge=-1.0, le=1.0,
+        description="-1.0 (hostile) to 1.0 (fully trusted)",
+    )
+    key_events: list[str] = Field(
+        default_factory=list,
+        description="Recent relationship-changing events (max 5)",
+    )
+
+
 # ── OpenAI-compatible Request/Response ──────────────────────────
 
 

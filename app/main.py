@@ -1,17 +1,16 @@
 from contextlib import asynccontextmanager
 
-import httpx
 import structlog
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-from app.config import settings
-from app.extractor import init_extractor
-from app.memory import init_store
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
+from app.config import settings
+from app.extractor import init_extractor
+from app.llm_client import LLMClient
+from app.memory import init_store
 from app.proxy import limiter, router
 
 logger = structlog.get_logger()
@@ -24,15 +23,15 @@ async def lifespan(app: FastAPI):
     store = init_store()
     app.state.store = store
 
-    client = httpx.AsyncClient(http2=True)
-    app.state.http_client = client
+    llm_client = LLMClient()
+    await llm_client.init()
+    app.state.llm_client = llm_client
 
     executor = init_extractor(store)
     app.state.executor = executor
 
     logger.info(
         "app_started",
-        upstream=settings.upstream_base_url,
         host=settings.host,
         port=settings.port,
     )
@@ -40,14 +39,14 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
-    await client.aclose()
+    await llm_client.close()
     logger.info("app_shutdown")
 
 
 app = FastAPI(
     title="SAGA-MEM RP Memory Engine",
-    description="RisuAI reverse proxy with LangMem episode memory",
-    version="0.1.0",
+    description="RisuAI multi-provider LLM proxy with LangMem episode memory",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -71,14 +70,13 @@ app.include_router(router)
 @app.get("/health")
 async def health():
     """Health check endpoint."""
-    return {"status": "ok", "version": "0.1.0"}
+    return {"status": "ok", "version": "0.2.0"}
 
 
 @app.get("/debug/store")
 async def debug_store():
-    """Debug: dump all items in the store."""
+    """Debug: dump all items in the store. DEV ONLY."""
     store = app.state.store
-    # InMemoryStore internal: store._data is a dict of namespace -> dict of key -> value
     data = {}
     for namespace, items in store._data.items():
         ns_key = "/".join(namespace)

@@ -3,17 +3,16 @@ import hashlib
 import json
 from collections.abc import AsyncGenerator
 
-import httpx
 import structlog
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from langgraph.store.memory import InMemoryStore
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import settings
 from app.extractor import extract_episodes
+from app.llm_client import LLMClient
 from app.memory import render_recall, search_episodes
 from app.schemas import ChatCompletionRequest
 
@@ -22,47 +21,78 @@ logger = structlog.get_logger()
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
 
-MEMORY_MARKER = "<!-- MEMORY_ENGINE:EPISODE_RECALL -->"
+MARKERS = {
+    "world_state": "<!-- MEMORY_ENGINE:WORLD_STATE -->",
+    "episode_recall": "<!-- MEMORY_ENGINE:EPISODE_RECALL -->",
+    "narrative_cue": "<!-- MEMORY_ENGINE:NARRATIVE_CUE -->",
+}
+
+# Turn counter per card_id (in-memory, reset on restart)
+_turn_counts: dict[str, int] = {}
 
 
 def _find_injection_index(messages: list[dict]) -> int:
-    """Find the index to inject memory (slot 6 position).
-
-    Strategy:
-    1. If placeholder marker exists, use that position.
-    2. Otherwise, find the last system message before the trailing
-       chat history block (contiguous user/assistant at the tail).
-    """
-    for i, msg in enumerate(messages):
-        if msg.get("content") and MEMORY_MARKER in str(msg["content"]):
-            return i
-
-    # Walk backward: find the start of the trailing chat history block
+    """Find slot 6 position: last system message before trailing chat history."""
     for i in range(len(messages) - 1, -1, -1):
         if messages[i]["role"] == "system":
             return i + 1
-
     return len(messages)
 
 
-def _inject_memory(messages: list[dict], recall_text: str) -> list[dict]:
-    """Inject memory recall into the messages array at slot 6."""
-    if not recall_text:
+def _inject_memory(
+    messages: list[dict],
+    *,
+    episode_recall: str = "",
+    world_state: str = "",
+    narrative_cue: str = "",
+) -> list[dict]:
+    """Inject memory blocks into messages via markers or fallback slot 6.
+
+    Supports 3 placeholder markers:
+    - <!-- MEMORY_ENGINE:WORLD_STATE -->
+    - <!-- MEMORY_ENGINE:EPISODE_RECALL -->
+    - <!-- MEMORY_ENGINE:NARRATIVE_CUE -->
+
+    If no markers found, combines all blocks and injects at slot 6.
+    """
+    if not any([episode_recall, world_state, narrative_cue]):
         return messages
 
     messages = [dict(m) for m in messages]
 
-    # Check for placeholder marker first
+    # Try marker-based injection
+    marker_found = False
+    replacements = {
+        MARKERS["world_state"]: world_state,
+        MARKERS["episode_recall"]: episode_recall,
+        MARKERS["narrative_cue"]: narrative_cue,
+    }
+
     for msg in messages:
         content = msg.get("content", "")
-        if isinstance(content, str) and MEMORY_MARKER in content:
-            msg["content"] = content.replace(MEMORY_MARKER, recall_text)
-            return messages
+        if not isinstance(content, str):
+            continue
+        for marker, text in replacements.items():
+            if marker in content:
+                msg["content"] = content.replace(marker, text or "")
+                content = msg["content"]
+                marker_found = True
 
-    # Fallback: insert as new system message
+    if marker_found:
+        return messages
+
+    # Fallback: combine all blocks and inject at slot 6
+    blocks = []
+    if world_state:
+        blocks.append(world_state)
+    if episode_recall:
+        blocks.append(episode_recall)
+    if narrative_cue:
+        blocks.append(narrative_cue)
+
+    combined = "\n".join(blocks)
     idx = _find_injection_index(messages)
-    memory_msg = {"role": "system", "content": recall_text}
-    messages.insert(idx, memory_msg)
+    messages.insert(idx, {"role": "system", "content": combined})
     return messages
 
 
@@ -96,14 +126,14 @@ def _get_last_user_message(messages: list[dict]) -> str:
 @router.post("/v1/chat/completions", response_model=None)
 @limiter.limit("60/minute")
 async def chat_completions(request: Request):
-    """Reverse proxy for OpenAI-compatible chat completions.
+    """OpenAI-compatible chat completions with multi-provider routing.
 
     Flow:
     1. Parse request
     2. Search episode memory
     3. Inject recall into messages (slot 6)
-    4. Forward to upstream LLM via httpx SSE
-    5. Stream response back to RisuAI
+    4. Route to correct provider (Anthropic/Google/OpenAI) via LLMClient
+    5. Stream response back to RisuAI in OpenAI SSE format
     6. Async: extract episodes from conversation
     """
     body = await request.json()
@@ -114,6 +144,7 @@ async def chat_completions(request: Request):
     query = _get_last_user_message([m.model_dump() for m in parsed.messages])
 
     store: InMemoryStore = request.app.state.store
+    llm_client: LLMClient = request.app.state.llm_client
 
     # Search episodes
     episodes = await search_episodes(
@@ -124,49 +155,53 @@ async def chat_completions(request: Request):
     )
     recall_text = render_recall(episodes)
 
+    # Track turns
+    turn_count = _turn_counts.get(card_id, 0)
+    _turn_counts[card_id] = turn_count + 1
+
     # Inject memory into messages
     raw_messages = [m.model_dump(exclude_none=True) for m in parsed.messages]
-    injected_messages = _inject_memory(raw_messages, recall_text)
+    injected_messages = _inject_memory(
+        raw_messages,
+        episode_recall=recall_text,
+    )
 
-    # Build upstream request body
-    upstream_body = body.copy()
-    upstream_body["messages"] = injected_messages
+    provider = llm_client.detect_provider(parsed.model)
 
     logger.info(
         "proxy_request",
         user_id=user_id,
         card_id=card_id,
         model=parsed.model,
+        provider=provider,
         stream=parsed.stream,
         episodes_recalled=len(episodes),
         original_messages=len(parsed.messages),
         injected_messages=len(injected_messages),
     )
 
-    client: httpx.AsyncClient = request.app.state.http_client
-    upstream_url = settings.upstream_base_url + "/chat/completions"
+    # Build LLM call kwargs
+    llm_kwargs: dict = {}
+    if parsed.temperature is not None:
+        llm_kwargs["temperature"] = parsed.temperature
+    if parsed.top_p is not None:
+        llm_kwargs["top_p"] = parsed.top_p
+    if parsed.stop is not None:
+        llm_kwargs["stop"] = parsed.stop
 
-    # Forward Authorization header from RisuAI, fallback to configured key
-    auth_header = request.headers.get("authorization", "")
-    if not auth_header and settings.openai_api_key:
-        auth_header = "Bearer " + settings.openai_api_key
-
-    headers = {
-        "Authorization": auth_header,
-        "Content-Type": "application/json",
-    }
+    max_tokens = parsed.max_tokens or parsed.max_completion_tokens or 8192
 
     if parsed.stream:
         return StreamingResponse(
-            _stream_upstream(
-                client=client,
-                url=upstream_url,
-                headers=headers,
-                body=upstream_body,
+            _stream_and_extract(
+                llm_client=llm_client,
+                model=parsed.model,
                 messages=injected_messages,
+                max_tokens=max_tokens,
                 user_id=user_id,
                 card_id=card_id,
                 app=request.app,
+                **llm_kwargs,
             ),
             media_type="text/event-stream",
             headers={
@@ -176,105 +211,78 @@ async def chat_completions(request: Request):
             },
         )
 
-    # Non-streaming: forward with retry
-    resp = await _post_upstream(client, upstream_url, headers, upstream_body)
+    # Non-streaming
+    try:
+        response = await llm_client.call(
+            parsed.model,
+            injected_messages,
+            max_tokens=max_tokens,
+            **llm_kwargs,
+        )
+    except Exception:
+        logger.exception("llm_call_failed", model=parsed.model, provider=provider)
+        return JSONResponse(
+            content={"error": {"message": "LLM call failed", "type": "server_error"}},
+            status_code=502,
+        )
 
     # Trigger async extraction
+    assistant_content = ""
+    try:
+        assistant_content = response["choices"][0]["message"]["content"]
+    except (KeyError, IndexError):
+        logger.warning("assistant_content_extract_failed")
+
     _trigger_extraction(
         app=request.app,
         messages=injected_messages,
-        assistant_content=_extract_assistant_from_response(resp.json()),
+        assistant_content=assistant_content,
         user_id=user_id,
         card_id=card_id,
     )
 
-    return JSONResponse(
-        content=resp.json(),
-        status_code=resp.status_code,
-    )
+    return JSONResponse(content=response)
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
-    reraise=True,
-)
-async def _post_upstream(
-    client: httpx.AsyncClient,
-    url: str,
-    headers: dict,
-    body: dict,
-) -> httpx.Response:
-    """POST to upstream with tenacity retry on transient errors."""
-    resp = await client.post(url, headers=headers, json=body, timeout=120.0)
-    if resp.status_code >= 500:
-        logger.warning(
-            "upstream_server_error",
-            status=resp.status_code,
-            body=resp.text[:200],
-        )
-        resp.raise_for_status()
-    return resp
-
-
-async def _stream_upstream(
+async def _stream_and_extract(
     *,
-    client: httpx.AsyncClient,
-    url: str,
-    headers: dict,
-    body: dict,
+    llm_client: LLMClient,
+    model: str,
     messages: list[dict],
+    max_tokens: int,
     user_id: str,
     card_id: str,
     app: FastAPI,
+    **kwargs,
 ) -> AsyncGenerator[bytes, None]:
-    """Stream SSE from upstream LLM, collecting full response.
-
-    Uses aiter_bytes() for raw byte passthrough to preserve SSE framing.
-    Checks upstream status before streaming; yields error body on non-2xx.
-    """
+    """Stream from LLMClient, collect response, trigger extraction."""
     collected_chunks: list[str] = []
-    line_buffer = b""
 
-    async with client.stream(
-        "POST",
-        url,
-        headers=headers,
-        json=body,
-        timeout=120.0,
-    ) as resp:
-        # Propagate upstream errors instead of masking as 200
-        if resp.status_code != 200:
-            error_body = await resp.aread()
-            logger.warning(
-                "upstream_error_in_stream",
-                status=resp.status_code,
-                body=error_body[:200].decode("utf-8", errors="replace"),
-            )
-            yield error_body
-            return
+    try:
+        async for sse_bytes in llm_client.stream(
+            model, messages, max_tokens=max_tokens, **kwargs,
+        ):
+            yield sse_bytes
 
-        async for raw_chunk in resp.aiter_bytes():
-            # Forward raw bytes to client (preserves SSE framing)
-            yield raw_chunk
-
-            # Side-channel: parse SSE lines for content extraction
-            line_buffer += raw_chunk
-            while b"\n" in line_buffer:
-                line_bytes, line_buffer = line_buffer.split(b"\n", 1)
-                line = line_bytes.decode("utf-8", errors="replace").rstrip("\r")
-
+            # Side-channel: collect content for extraction
+            try:
+                line = sse_bytes.decode("utf-8", errors="replace").strip()
                 if line.startswith("data: ") and line != "data: [DONE]":
-                    try:
-                        chunk = json.loads(line[6:])
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            collected_chunks.append(content)
-                    except (json.JSONDecodeError, IndexError, KeyError):
-                        logger.warning("sse_chunk_parse_failed", raw_line=line[:100])
+                    chunk = json.loads(line[6:])
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        collected_chunks.append(content)
+            except (json.JSONDecodeError, IndexError, KeyError):
+                pass
+    except Exception:
+        logger.exception("llm_stream_failed", model=model)
+        error = json.dumps({"error": {"message": "LLM stream failed", "type": "server_error"}})
+        yield ("data: " + error + "\n\n").encode()
+        yield b"data: [DONE]\n\n"
+        return
 
-    # After stream completes, trigger async extraction
+    # Trigger extraction
     assistant_content = "".join(collected_chunks)
     if assistant_content:
         _trigger_extraction(
@@ -309,7 +317,6 @@ def _trigger_extraction(
     if executor is None:
         return
 
-    # Build full conversation including assistant response
     full_messages = messages + [
         {"role": "assistant", "content": assistant_content}
     ]
@@ -322,12 +329,3 @@ def _trigger_extraction(
             card_id=card_id,
         )
     )
-
-
-def _extract_assistant_from_response(response: dict) -> str:
-    """Extract assistant content from non-streaming response."""
-    try:
-        return response["choices"][0]["message"]["content"]
-    except (KeyError, IndexError):
-        logger.warning("assistant_content_extract_failed", response_keys=list(response.keys()))
-        return ""

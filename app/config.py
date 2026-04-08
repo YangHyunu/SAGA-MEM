@@ -25,6 +25,10 @@ class Settings(BaseSettings):
         default="",
         description="Google API key (Gemini extraction, free tier)",
     )
+    anthropic_api_key: str = Field(
+        default="",
+        description="Anthropic API key (Claude models)",
+    )
 
     # Memory engine
     extraction_model: str = Field(
@@ -56,3 +60,5 @@ if settings.openai_api_key and not os.environ.get("OPENAI_API_KEY"):
     os.environ["OPENAI_API_KEY"] = settings.openai_api_key
 if settings.google_api_key and not os.environ.get("GOOGLE_API_KEY"):
     os.environ["GOOGLE_API_KEY"] = settings.google_api_key
+if settings.anthropic_api_key and not os.environ.get("ANTHROPIC_API_KEY"):
+    os.environ["ANTHROPIC_API_KEY"] = settings.anthropic_api_key

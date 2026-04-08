@@ -9,12 +9,14 @@ from langgraph.store.memory import InMemoryStore
 import structlog
 
 from app.config import settings
-from app.schemas import RPEpisode
+from app.schemas import CharacterState, RPEpisode, Relationship
 
 logger = structlog.get_logger()
 
-# Namespace: (user_id, card_id, "episodes")
+# Namespaces
 EPISODE_NS = NamespaceTemplate(("{user_id}", "{card_id}", "episodes"))
+CHARACTER_NS = NamespaceTemplate(("{user_id}", "{card_id}", "characters"))
+RELATIONSHIP_NS = NamespaceTemplate(("{user_id}", "{card_id}", "relationships"))
 
 
 def init_extractor(
@@ -42,28 +44,30 @@ def init_extractor(
         )
         return None
 
-    manager = create_memory_store_manager(
+    # Episode extractor (primary)
+    episode_manager = create_memory_store_manager(
         settings.extraction_model,
-        schemas=[RPEpisode],
+        schemas=[RPEpisode, Relationship],
         namespace=EPISODE_NS,
         enable_inserts=True,
         enable_deletes=False,
         store=store,
         instructions=(
-            "Extract RP episodes from the conversation. "
-            "Focus on: scene changes, combat, relationship shifts, "
-            "world state changes, and emotionally significant moments. "
+            "Extract from the RP conversation:\n"
+            "1. RPEpisode: scene changes, combat, relationship shifts, "
+            "world state changes, emotional moments. "
             "Rate importance 0.9+ for world changes/death, "
-            "0.7+ for relationship/combat, 0.4+ for daily events, "
-            "0.1+ for trivial chat."
+            "0.7+ for relationship/combat, 0.4+ for daily, 0.1+ for trivial.\n"
+            "2. Relationship: track relationship changes between characters. "
+            "trust_level: -1.0 (hostile) to 1.0 (fully trusted)."
         ),
     )
 
-    executor = ReflectionExecutor(manager, store=store)
+    executor = ReflectionExecutor(episode_manager, store=store)
     logger.info(
         "extractor_initialized",
         model=settings.extraction_model,
-        schema="RPEpisode",
+        schemas=["RPEpisode", "Relationship"],
     )
     return executor
 

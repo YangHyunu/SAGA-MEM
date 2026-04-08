@@ -32,7 +32,7 @@ class Settings(BaseSettings):
 
     # Memory engine
     extraction_model: str = Field(
-        default="gpt-4o-mini",
+        default="google_genai:gemini-2.5-flash",
         description="Model for episode extraction (Flash-tier)",
     )
     token_budget: int = Field(

@@ -63,13 +63,12 @@ def init_extractor(
         ),
     )
 
-    executor = ReflectionExecutor(episode_manager, store=store)
     logger.info(
         "extractor_initialized",
         model=settings.extraction_model,
         schemas=["RPEpisode", "Relationship"],
     )
-    return executor
+    return episode_manager
 
 
 async def extract_episodes(
@@ -79,10 +78,10 @@ async def extract_episodes(
     user_id: str,
     card_id: str,
 ) -> None:
-    """Submit messages for async background episode extraction.
+    """Extract episodes via direct ainvoke (non-blocking via asyncio.create_task).
 
-    Non-blocking: returns immediately, extraction happens in background.
-    Failures are logged but do not affect the main response.
+    ReflectionExecutor removed — it silently swallows errors in background threads.
+    asyncio.create_task in proxy.py already ensures this is non-blocking.
     """
     try:
         config = {
@@ -91,16 +90,19 @@ async def extract_episodes(
                 "card_id": card_id,
             }
         }
-        executor.submit(messages, config=config)
+        await executor.ainvoke(
+            {"messages": messages},
+            config=config,
+        )
         logger.info(
-            "episode_extraction_submitted",
+            "episode_extraction_complete",
             user_id=user_id,
             card_id=card_id,
             message_count=len(messages),
         )
     except Exception:
         logger.exception(
-            "episode_extraction_submit_failed",
+            "episode_extraction_failed",
             user_id=user_id,
             card_id=card_id,
         )

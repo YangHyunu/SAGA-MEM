@@ -10,7 +10,7 @@ logger = structlog.get_logger()
 class Settings(BaseSettings):
     """RP Memory Engine configuration."""
 
-    model_config = {"env_prefix": "SAGA_", "env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_prefix": "SAGA_", "env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     # Upstream LLM API
     upstream_base_url: str = Field(
